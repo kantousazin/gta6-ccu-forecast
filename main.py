@@ -24,6 +24,10 @@ themselves (never on any case's answer):
     launches' log ratios for that hour, with the median shrunk slightly
     toward persistence (MEDIAN_SHRINK) and the spread widened slightly
     (SPREAD_WIDEN), both constants chosen on the same cross-validation.
+    The five log-quantile curves are then smoothed across neighbouring
+    hours (weights 1 / (1 + distance)), which cross-validation also favoured:
+    an hour's curve is estimated from a couple of dozen launches, so its
+    neighbours carry real information about it.
   * With too few usable training launches the filters relax step by step,
     and with none at all the program falls back to persistence with a
     random-walk spread, so it always writes a valid forecast.
@@ -165,6 +169,26 @@ def clamp_row(values):
     return row
 
 
+def smooth_curves(log_rows):
+    """Smooth each level's log-quantile curve across neighbouring hours.
+
+    log_rows maps hour -> [log quantile per level]. Every hour is replaced
+    by the weighted mean of itself and its immediate neighbours, weights
+    1 / (1 + distance), renormalised at the ends of the day.
+    """
+    hours = sorted(log_rows)
+    smoothed = {}
+    for hour in hours:
+        neighbours = [other for other in hours if abs(other - hour) <= 1]
+        weights = [1.0 / (1.0 + abs(other - hour)) for other in neighbours]
+        total = sum(weights)
+        smoothed[hour] = [
+            sum(log_rows[other][i] * w for other, w in zip(neighbours, weights)) / total
+            for i in range(len(log_rows[hour]))
+        ]
+    return smoothed
+
+
 def forecast_case(case):
     levels = case.get("levels") or DEFAULT_LEVELS
     first = next((row for row in case["known"] if row["hour"] == 1), None)
@@ -172,28 +196,30 @@ def forecast_case(case):
         raise ValueError("case has no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
     pool = training_pool(case, math.log(p1))
-    rows = []
+    log_rows = {}
     for request in case["forecast"]:
         hour = request["hour"]
         samples = pool.get(hour) or []
         if len(samples) >= 4:
             median = weighted_quantile(samples, 0.5)
-            quantiles = []
-            for tau in levels:
-                offset = weighted_quantile(samples, tau) - median
-                log_q = MEDIAN_SHRINK * median + SPREAD_WIDEN * offset
-                quantiles.append(p1 * math.exp(log_q))
+            log_rows[hour] = [
+                MEDIAN_SHRINK * median
+                + SPREAD_WIDEN * (weighted_quantile(samples, tau) - median)
+                for tau in levels
+            ]
         else:
             # Persistence fallback: hour 1's count, random-walk spread.
             spread = FALLBACK_SIGMA * math.sqrt(hour - 1)
-            quantiles = []
-            for tau in levels:
-                if tau in DEFAULT_LEVELS:
-                    z = Z_LEVELS[DEFAULT_LEVELS.index(tau)]
-                else:
-                    z = 0.0
-                quantiles.append(p1 * math.exp(z * spread))
-        rows.append({"hour": hour, "q": clamp_row(quantiles)})
+            log_rows[hour] = [
+                (Z_LEVELS[DEFAULT_LEVELS.index(tau)] if tau in DEFAULT_LEVELS else 0.0)
+                * spread
+                for tau in levels
+            ]
+    log_rows = smooth_curves(log_rows)
+    rows = [
+        {"hour": hour, "q": clamp_row([p1 * math.exp(v) for v in log_rows[hour]])}
+        for hour in sorted(log_rows)
+    ]
     return {"hours": rows}
 
 
